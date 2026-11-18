@@ -1,0 +1,253 @@
+name: Zbuduj APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: web
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Przygotuj projekt Android
+        run: |
+          P=a/app/src/main
+          mkdir -p $P/java/io/github/notatniksyntez/apk $P/res/mipmap-xxxhdpi $P/assets/www
+          rsync -a --exclude .git --exclude .github web/ $P/assets/www/
+          cp web/icon-512.png $P/res/mipmap-xxxhdpi/ic_launcher.png
+
+          cat > a/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'NotatnikSyntez'
+          include ':app'
+          EOF
+
+          cat > a/build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+
+          cat > a/gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+
+          cat > a/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'io.github.notatniksyntez.apk'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'io.github.notatniksyntez.apk'
+              minSdk 24
+              targetSdk 34
+              versionCode Integer.parseInt(System.getenv('VCODE') ?: '1')
+              versionName '1.2.1'
+            }
+            signingConfigs {
+              rel {
+                storeFile file('klucz.jks')
+                storePassword System.getenv('KSPASS')
+                keyAlias 'apk'
+                keyPassword System.getenv('KSPASS')
+              }
+            }
+            buildTypes {
+              release {
+                minifyEnabled false
+                signingConfig signingConfigs.rel
+              }
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            lint { checkReleaseBuilds false; abortOnError false }
+          }
+          dependencies { implementation 'androidx.webkit:webkit:1.11.0' }
+          EOF
+
+          cat > $P/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application
+                android:label="Notatnik Syntez"
+                android:icon="@mipmap/ic_launcher"
+                android:allowBackup="true"
+                android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity
+                  android:name=".MainActivity"
+                  android:exported="true"
+                  android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize|uiMode">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > $P/java/io/github/notatniksyntez/apk/MainActivity.java <<'EOF'
+          package io.github.notatniksyntez.apk;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.ServiceWorkerClient;
+          import android.webkit.ServiceWorkerController;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import androidx.webkit.WebViewAssetLoader;
+
+          public class MainActivity extends Activity {
+            private static final String HOST = "appassets.androidplatform.net";
+            private static final String START = "https://" + HOST + "/assets/www/index.html";
+            private static final int PICK = 42;
+            private WebView web;
+            private ValueCallback<Uri[]> pending;
+
+            @Override
+            protected void onCreate(Bundle saved) {
+              super.onCreate(saved);
+              getWindow().setStatusBarColor(Color.BLACK);
+              getWindow().setNavigationBarColor(Color.BLACK);
+
+              final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                  .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                  .build();
+
+              web = new WebView(this);
+              web.setBackgroundColor(Color.BLACK);
+              WebSettings s = web.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setDatabaseEnabled(true);
+              s.setAllowFileAccess(false);
+              s.setAllowContentAccess(true);
+
+              web.setWebViewClient(new WebViewClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                  return loader.shouldInterceptRequest(r.getUrl());
+                }
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                  Uri u = r.getUrl();
+                  if (HOST.equals(u.getHost())) return false;
+                  try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception e) { }
+                  return true;
+                }
+              });
+
+              ServiceWorkerController.getInstance().setServiceWorkerClient(new ServiceWorkerClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebResourceRequest r) {
+                  return loader.shouldInterceptRequest(r.getUrl());
+                }
+              });
+
+              web.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                  if (pending != null) pending.onReceiveValue(null);
+                  pending = cb;
+                  try {
+                    startActivityForResult(p.createIntent(), PICK);
+                  } catch (Exception e) {
+                    pending = null;
+                    return false;
+                  }
+                  return true;
+                }
+              });
+
+              setContentView(web);
+              if (saved != null) web.restoreState(saved);
+              else web.loadUrl(START);
+            }
+
+            @Override
+            protected void onActivityResult(int req, int res, Intent data) {
+              if (req == PICK && pending != null) {
+                pending.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                pending = null;
+                return;
+              }
+              super.onActivityResult(req, res, data);
+            }
+
+            @Override
+            protected void onSaveInstanceState(Bundle out) {
+              super.onSaveInstanceState(out);
+              web.saveState(out);
+            }
+
+            @Override
+            public void onBackPressed() {
+              if (web.canGoBack()) web.goBack();
+              else super.onBackPressed();
+            }
+          }
+          EOF
+
+      - name: Klucz podpisu
+        env:
+          KS: ${{ secrets.APK_KEYSTORE }}
+          KP: ${{ secrets.APK_KEYSTORE_PASS }}
+        run: |
+          mkdir -p out
+          if [ -n "$KS" ] && [ -n "$KP" ]; then
+            echo "$KS" | base64 -d > a/app/klucz.jks
+            echo "KSPASS=$KP" >> $GITHUB_ENV
+          else
+            PASS=$(openssl rand -hex 16)
+            echo "::add-mask::$PASS"
+            keytool -genkeypair -keystore a/app/klucz.jks -alias apk -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" -dname "CN=Notatnik Syntez"
+            echo "KSPASS=$PASS" >> $GITHUB_ENV
+            mkdir -p klucz
+            base64 -w0 a/app/klucz.jks > klucz/APK_KEYSTORE.txt
+            echo -n "$PASS" > klucz/APK_KEYSTORE_PASS.txt
+          fi
+
+      - name: Budowanie
+        env:
+          VCODE: ${{ github.run_number }}
+        run: |
+          cd a
+          gradle assembleRelease --no-daemon --stacktrace
+          cp app/build/outputs/apk/release/app-release.apk ../out/NotatnikSyntez.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NotatnikSyntez-apk
+          path: out/NotatnikSyntez.apk
+
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('klucz/APK_KEYSTORE.txt') != ''
+        with:
+          name: klucz-zachowaj
+          path: klucz/
+          retention-days: 1
